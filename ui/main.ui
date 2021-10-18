@@ -61,7 +61,7 @@
         <item>
          <widget class="QStackedWidget" name="stackedWidget">
           <property name="currentIndex">
-           <number>0</number>
+           <number>1</number>
           </property>
           <widget class="QWidget" name="pageSingle">
            <property name="sizePolicy">
@@ -106,7 +106,7 @@
                </size>
               </property>
               <property name="dragDropMode">
-               <enum>QAbstractItemView::DragOnly</enum>
+               <enum>QAbstractItemView::DragDrop</enum>
               </property>
               <property name="selectionMode">
                <enum>QAbstractItemView::ExtendedSelection</enum>
@@ -206,6 +206,7 @@
     <property name="title">
      <string>Tags</string>
     </property>
+    <addaction name="actionAdd_tag"/>
    </widget>
    <widget class="QMenu" name="menuView">
     <property name="title">
@@ -272,6 +273,11 @@
   <action name="actionNew_database">
    <property name="text">
     <string>New database</string>
+   </property>
+  </action>
+  <action name="actionAdd_tag">
+   <property name="text">
+    <string>Add tag</string>
    </property>
   </action>
  </widget>
