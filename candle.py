@@ -1,10 +1,12 @@
 from operator import and_
 import sys
 import os
-import math
+import queue
+from math import ceil
 from collections import namedtuple
 from PyQt5 import QtGui, QtWidgets, QtCore, uic
 from PyQt5.QtCore import Qt
+from PyQt5.QtCore import pyqtSignal
 from PyQt5.QtGui import QImageIOHandler, QMovie
 from PyQt5.QtWidgets import QFileDialog, QListWidgetItem
 from logzero import logger
@@ -16,6 +18,8 @@ from db import Base
 from alchemy import Tags, Files, FileTags
 
 preview = namedtuple("preview", "id title image")
+
+image_thumbs_queue = queue.Queue()
 
 class Candle(QtWidgets.QMainWindow):
     def __init__(self):
@@ -29,10 +33,18 @@ class Candle(QtWidgets.QMainWindow):
 
         self.curImageID = None
         self.restrictedIDs = []
+        
         self.image = None
+        self.zoom = 1
+
         self.movie = None
         self.movie_aspect = None
         self.timer = None
+
+        self.thread_load = None
+        self.worker = None
+
+        self.placeholder_icon = QtGui.QIcon(os.path.join("ui", "placeholder.png"))
 
         self.tagModel = None
 
@@ -45,6 +57,8 @@ class Candle(QtWidgets.QMainWindow):
 
         self.allImagesView.itemClicked.connect(self.thumbSelected)
 
+        self.singleImageView.wheelEvent = self.scrollingEvent
+
         # connections
         
         self.actionNew_database.triggered.connect(self.newDatabase)
@@ -55,11 +69,11 @@ class Candle(QtWidgets.QMainWindow):
 
         self.actionAdd_tag.triggered.connect(self.newTag)
 
-        self.actionZoom_In.triggered.connect(lambda: self.scaleImage(1.25))
+        self.actionZoom_In.triggered.connect(self.zoomIn)
 
-        self.actionZoom_Out.triggered.connect(lambda: self.scaleImage(0.75))
+        self.actionZoom_Out.triggered.connect(self.zoomOut)
 
-        self.actionFit_to_Window.triggered.connect(lambda: self.scaleImage(1, newScaleFactor=1))
+        self.actionFit_to_Window.triggered.connect(self.resetZoom)
 
         self.actionExit.triggered.connect(self.exitCandle)
 
@@ -84,42 +98,43 @@ class Candle(QtWidgets.QMainWindow):
 
     def newDatabase(self):
         path, _ = QFileDialog.getSaveFileName(self,"QFileDialog.getSaveFileName()","","SQLite3 (*.db);;All Files (*)")
-        self.engine = create_engine(fr"sqlite:///{path}")
+        if path:
+            self.engine = create_engine(fr"sqlite:///{path}", connect_args={'check_same_thread': False})
 
-        Base.metadata.create_all(self.engine)
+            Base.metadata.create_all(self.engine)
 
-        session = sessionmaker(bind=self.engine)
-        self.dbconn = session()
+            session = sessionmaker(bind=self.engine)
+            self.dbconn = session()
 
-        logger.info("Database connected")
+            logger.info("Database connected")
 
-        self.getImageIDBounds()
+            self.getImageIDBounds()
 
-        self.cache.clear()
-        self.refreshTags()
-        self.refreshImages()
+            self.cache.clear()
+            self.refreshTags()
+            self.refreshImages()
 
     def loadDatabase(self):
         path, _ = QFileDialog.getOpenFileName(self)
+        if path:
+            self.db_path = path
 
-        self.db_path = path
+            self.engine = create_engine(fr"sqlite:///{path}", connect_args={'check_same_thread': False})
 
-        self.engine = create_engine(fr"sqlite:///{path}")
+            session = sessionmaker(bind=self.engine)
+            self.dbconn = session()
 
-        session = sessionmaker(bind=self.engine)
-        self.dbconn = session()
+            logger.info("Database connected")
 
-        logger.info("Database connected")
+            self.getImageIDBounds()
 
-        self.getImageIDBounds()
-
-        self.cache.clear()
-        self.refreshTags()
+            self.cache.clear()
+            self.refreshTags()
         self.refreshImages()
         
 
     def autoLoadDB(self):
-        self.engine = create_engine(r"sqlite:///test.db")
+        self.engine = create_engine(r"sqlite:///test.db", connect_args={'check_same_thread': False})
 
         session = sessionmaker(bind=self.engine)
         self.dbconn = session()
@@ -138,18 +153,16 @@ class Candle(QtWidgets.QMainWindow):
 
     def importFiles(self):
         files, _ = QFileDialog.getOpenFileNames(self)
-        for file in files:
-            if os.path.isfile(file):
-                try:
-                    query = Files.insert().values(
-                        name = (os.path.split(file))[1],
-                        path = file
-                    )
+        for file in files[:]:
+            if not os.path.isfile(file):
+                files.remove(file)
 
-                    self.dbconn.execute(query)
-                except IntegrityError:
-                    logger.error(f"Integrity Error when importing {file}")
-                    # Messagebox here
+        self.engine.execute(Files.__table__.insert(),
+            [dict(name=(os.path.split(file))[1], path=file) for file in files]
+        )
+
+        self.getImageIDBounds()
+
         self.cache.clear()
         self.refreshImages()
 
@@ -238,6 +251,9 @@ class Candle(QtWidgets.QMainWindow):
 
     ### Image Functions
 
+    def increaseProgressBar(self, i):
+        self.progressBar.setValue(i)
+
     def refreshImages(self):
         self.allImagesView.clear()
         if "all_files_data" in self.cache:
@@ -245,21 +261,24 @@ class Candle(QtWidgets.QMainWindow):
                 item = QListWidgetItem(image[0], image[1])
                 self.allImagesView.addItem(item)
         else:        
+            self.cache["all_files_data"] = {}
             all_files = self.dbconn.query(Files)
-
-            ## only load images in view +- 10 or so
 
             self.cache["all_files_data"] = {}
 
-            for file in all_files:
-                path = file.path
-                name = file.name
-                icon = QtGui.QIcon(path)
-                item = QListWidgetItem(icon, name)
-                self.allImagesView.addItem(item)
-                self.cache["all_files_data"][name] = (icon, name)
+            self.progressBar.setMaximum(all_files.count())
+            
+            self.worker = LoadImageThumbs(all_files, self.allImagesView, self.cache)
+            self.worker.begin()
+            self.worker.progress.connect(self.increaseProgressBar)
 
-        
+
+    def loadThumb(self):
+        item = image_thumbs_queue.get()
+        image = QListWidgetItem(item[0], item[1])
+        print(item[1])
+        self.allImagesView.addItem(image)
+        self.cache["all_files_data"][item[1]] = item
 
     def refreshImagesWTags(self, tags):
         self.allImagesView.clear()
@@ -289,6 +308,7 @@ class Candle(QtWidgets.QMainWindow):
             menu = QtWidgets.QMenu()
             image_display = QtWidgets.QAction("Display image")
             image_delete = QtWidgets.QAction("Delete image")
+            image_test = QtWidgets.QAction("test")
 
             menu.addAction(image_display)
             menu.addAction(image_delete)
@@ -300,9 +320,9 @@ class Candle(QtWidgets.QMainWindow):
             except Exception as e:
                 print(f"No item selected {e}")
 
-            if menu_click == image_display :
+            if menu_click == image_display:
                 self.loadSingleImage(item)
-            if menu_click == image_delete :
+            if menu_click == image_delete:
                 pass # remove image from db and display
 
             return True
@@ -313,8 +333,11 @@ class Candle(QtWidgets.QMainWindow):
         return super(Candle, self).eventFilter(source, event)
     
     def loadSingleImage(self, item):
-        file_data = self.dbconn.query(Files).filter(Files.name == item.text()).one()
-        self.loadImage(file_data)
+        if item == None:
+            pass
+        else:
+            file_data = self.dbconn.query(Files).filter(Files.name == item.text()).one()
+            self.loadImage(file_data)
 
     def nextImage(self):
         if self.curImageID + 1 > self.highestImageID:
@@ -338,8 +361,11 @@ class Candle(QtWidgets.QMainWindow):
                     break
                 else:
                     i += 1
+            try:
+                self.loadImage(file_data)
+            except TypeError:
+                print("Error")
 
-            self.loadImage(file_data)
 
 
     def prevImage(self):
@@ -365,7 +391,10 @@ class Candle(QtWidgets.QMainWindow):
                 else:
                     i -= 1
 
-            self.loadImage(file_data)
+            try:
+                self.loadImage(file_data)
+            except TypeError:
+                print("Error")
 
     def getImageByID(self, id):
         file_data = self.dbconn.query(Files).filter(Files.id == id).first()
@@ -376,6 +405,9 @@ class Candle(QtWidgets.QMainWindow):
         path = file_data.path
 
         image_reader = QtGui.QImageReader(path)
+
+        self.curImageID = file_data.id
+        self.stackedWidget.setCurrentIndex(0)
 
         if image_reader.supportsAnimation() and image_reader.imageCount() > 1:
             self.movie = QMovie(path)
@@ -395,28 +427,41 @@ class Candle(QtWidgets.QMainWindow):
 
             self.movie.setScaledSize(size)
 
-            self.singleImageView.setMovie(self.movie)
+            scene = QtWidgets.QGraphicsScene()
+            label = QtWidgets.QLabel()
+
+            label.setMovie(self.movie)
 
             self.movie.start()
+
+            scene.addWidget(label)
+
+            self.singleImageView.setScene(scene)
 
             self.image = None
         else:
             self.image = QtGui.QPixmap(path)
-
+            
             if self.image.isNull():
                 QtWidgets.QMessageBox.information(self, "Image Viewer", "Cannot load %s." % file_data[1])
                 return
 
-            self.singleImageView.setPixmap(self.image.scaled(self.singleImageView.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            item = QtWidgets.QGraphicsPixmapItem(self.image)
+            item.setTransformationMode(Qt.SmoothTransformation)
+            scene = QtWidgets.QGraphicsScene()
+            scene.addItem(item)
+
+            self.singleImageView.setScene(scene)
+
+            self.singleImageView.fitInView(self.singleImageView.sceneRect(), Qt.KeepAspectRatio)
+            self.zoom = self.singleImageView.transform().m11()
 
             self.movie = None
-
-        self.curImageID = file_data.id
-        self.stackedWidget.setCurrentIndex(0)
     
     def resizeEvent(self, event):
         if event.spontaneous() and self.image:
-            self.singleImageView.setPixmap(self.image.scaled(self.singleImageView.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            self.singleImageView.fitInView(self.singleImageView.sceneRect(), Qt.KeepAspectRatio)
+            self.zoom = self.singleImageView.transform().m11()
         elif event.spontaneous() and self.movie:
             width = self.singleImageView.height() * self.movie_aspect
             if width <= self.singleImageView.width():
@@ -426,3 +471,64 @@ class Candle(QtWidgets.QMainWindow):
                 size = QtCore.QSize(self.singleImageView.width(), height)
 
             self.movie.setScaledSize(size)
+
+    def zoomIn(self):
+        try:
+            self.zoom = self.singleImageView.transform().m11() * 1.05
+            self.singleImageView.setTransform(QtGui.QTransform().scale(self.zoom, self.zoom))
+        except AttributeError:
+            pass
+
+    def zoomOut(self):
+        try:
+            self.zoom = self.singleImageView.transform().m11() / 1.05
+            self.singleImageView.setTransform(QtGui.QTransform().scale(self.zoom, self.zoom))
+        except AttributeError:
+            pass
+
+    def resetZoom(self):
+        try:
+            self.zoom = 1
+            self.singleImageView.setTransform(QtGui.QTransform().scale(self.zoom, self.zoom))
+        except AttributeError:
+            pass
+    
+    def scrollingEvent(self, event):
+        mouse = event.angleDelta().y()/120
+        if mouse > 0:
+            self.zoomIn()
+        elif mouse < 0:
+            self.zoomOut()
+
+class LoadImageThumbs(QtCore.QThread):
+    progress = pyqtSignal(int)
+    def __init__(self, file_data, allImagesView, cache):
+        QtCore.QThread.__init__(self)
+        self.file_data = file_data
+        self.allImagesView = allImagesView
+        self.cache = cache
+    def run(self):
+        i = 1
+
+        num_files = self.file_data.count()
+        increment = ceil(100 / num_files)
+        current_percentage = increment
+
+        for file in self.file_data:
+            path = file.path
+            name = file.name
+            image = QtGui.QImage(path)
+            pix = QtGui.QPixmap.fromImage(image)
+            icon = QtGui.QIcon(pix)
+            item = (icon, name)
+            image_thumbs_queue.put(item)
+
+            item = image_thumbs_queue.get()
+            image = QListWidgetItem(item[0], item[1])
+            self.allImagesView.addItem(image)
+            self.cache["all_files_data"][item[1]] = item
+            self.progress.emit(i)
+            i += 1
+
+    def begin(self):
+        self.start()

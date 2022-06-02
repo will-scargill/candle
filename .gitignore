@@ -136,3 +136,4 @@ dmypy.json
 # Image files for testing
 test.jpg
 test-2.png
+*.bak
